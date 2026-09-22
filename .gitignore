@@ -1,0 +1,19 @@
+# Local Python environments and caches.
+.venv/
+__pycache__/
+*.pyc
+
+# Generated reports, diagnostics and the final package are kept in this project.
+build/
+dist/
+output/
+work/
+
+# The standalone documentation and dependency notice are consolidated in README.md.
+docs/
+THIRD_PARTY.md
+
+# Do not commit local game or skin inputs if they are copied into this project.
+romfs/
+samples/
+pc-mods/
