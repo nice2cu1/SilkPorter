@@ -1,9 +1,11 @@
-"""构建兼容 SilkRuntime 的运行时皮肤包。
+"""构建兼容 SilkRuntime 的运行时皮肤目录。
 
-脚本只会把生成物复制到 SilkPorter/output。它接收 PC 皮肤根目录，读取相应的
-Texture2D、Collection 和 SpriteAtlas 分析报告，暂存精确 Texture2D 与整图
-ASTC4x4 SpriteAtlas PNG，针对当前 SilkRuntime ELF 生成 IPS32 补丁，并复制经过
-验证的 SilkRuntime main.npdm 和 subsdk9。运行时直接解析命名文件，不需要
+默认将生成物复制到 SilkPorter/output，也可指定单独的 staging 输出目录。脚本接收
+PC 皮肤根目录，读取 Texture2D、Collection 和 SpriteAtlas 分析报告，暂存精确纹理与整图
+SpriteAtlas PNG，并按运行时引用类型将 Sprite 引用的 Texture2D 放入
+Sprite Hook 可查找的目录。死亡茧、背后丝线和地图死亡图标也通过 SilkRuntime 的
+Sprite Hook 加载 PNG；本脚本不修改或输出 AssetBundle。脚本针对当前 SilkRuntime ELF 生成 IPS32 补丁，并复制
+经过验证的 SilkRuntime main.npdm 和 subsdk9。运行时直接解析命名文件，不需要
 skin.json 或 active.txt。原始样本和 PC Mod 文件不会被修改。
 """
 
@@ -16,6 +18,7 @@ import os
 import re
 import shutil
 import struct
+import sys
 from pathlib import Path
 
 
@@ -58,8 +61,39 @@ SPRITE_RENDERER_SET_SPRITE_RVA = 0x5F3F650
 EXPECTED_SPRITE_RENDERER_CALL_COUNT = 103
 UI_IMAGE_SET_SPRITE_RVA = 0x6182740
 EXPECTED_UI_IMAGE_CALL_COUNT = 64
+SPRITE_ATLAS_GET_SPRITE_RVA = 0x6031A00
+EXPECTED_SPRITE_ATLAS_GET_SPRITE_CALL_COUNT = 1
+SPRITE_ATLAS_GET_SPRITE_CALL_SITE = 0x5E95A60
+SPRITE_ATLAS_GET_SPRITE_CALL_INSTRUCTION = 0x94066FE8
+GAME_UPDATE_CALL_SITE = 0x24AB56C
+GAME_UPDATE_ORIGINAL_RVA = 0x24AB7A0
+GAME_UPDATE_INSTRUCTION = 0x9400008D
 NSO_HEADER_SIZE = 0x100
 MODULE_DELTA = 0x08A3A000
+
+# Generic textures with observed Sprite references. OnSpriteAssigned also
+# falls back to standalone/ so older classification does not hide Sprite assets.
+SPRITE_BACKED_GENERIC_TEXTURE_NAMES = frozenset({
+    "diving_bell_bench_grab0001",
+    "diving_bell_bench_grab0002",
+    "diving_bell_bench_grab0003",
+    "diving_bell_bench_grab0004",
+    "diving_bell_bench_grab0005",
+    "diving_bell_bench_grab0006",
+    "diving_bell_bench_grab0007",
+    "diving_bell_bench_grab0008",
+    "Hornet_death0003",
+    "Hornet_death0004",
+    "Hornet_death_cocoon_particle_chunks",
+    "Hornet_death_pieces_0000s_0001_6",
+    "HUD_frame_hunter_v2_red0005",
+    "HUD_frame_v30005",
+    "HUD_frame_v30009",
+    "HUD_frame_v3_extra_glow_flash0000",
+    "HUD_frame_v3_extra_glow_flash0001",
+    "HUD_frame_v3_extra_glow_flash0002",
+    "HUD_frame_v3_extra_glow_flash0003",
+})
 
 
 def sha256(path: Path) -> str:
@@ -243,7 +277,7 @@ def discover_collections(root: Path) -> dict[str, dict[int, Path]]:
     return collections
 
 
-def discover_standalone_textures(
+def discover_generic_textures(
     report_path: Path,
     skin_dir: Path,
     png_index: dict[str, list[Path]],
@@ -255,6 +289,7 @@ def discover_standalone_textures(
         raise SystemExit(f"通用目标报告缺少必要的映射：{report_path}")
 
     result: list[dict[str, object]] = []
+    found_sprite_backed: set[str] = set()
     for key in sorted(generic_inputs, key=str.casefold):
         info = generic_inputs.get(key)
         candidates = generic_targets.get(key)
@@ -282,14 +317,36 @@ def discover_standalone_textures(
                 f"独立纹理 {target_name} 的输入尺寸发生变化："
                 f"PNG={width}x{height}，报告={expected[0]}x{expected[1]}"
             )
-        result.append({
+        item: dict[str, object] = {
             "name": target_name,
             "source": source,
             "width": width,
             "height": height,
             "size": source.stat().st_size,
             "sha256": sha256(source),
-        })
+            "runtimeKind": "standalone",
+        }
+        if target_name in SPRITE_BACKED_GENERIC_TEXTURE_NAMES:
+            target_format = int(candidate.get("format", -1))
+            if target_format != 48:
+                raise SystemExit(
+                    f"Sprite 引用纹理 {target_name} 的目标格式发生变化："
+                    f"报告格式={target_format}，需要格式 48"
+                )
+            item.update({
+                "runtimeKind": "sprite",
+                "format": target_format,
+                "semanticKey": target_name,
+            })
+            found_sprite_backed.add(target_name)
+        result.append(item)
+
+    missing_sprite_backed = SPRITE_BACKED_GENERIC_TEXTURE_NAMES - found_sprite_backed
+    if missing_sprite_backed:
+        missing = ", ".join(sorted(missing_sprite_backed))
+        raise SystemExit(
+            "分析报告没有找到预期的 Sprite 引用 Texture2D 目标：" + missing
+        )
     return result
 
 
@@ -327,6 +384,10 @@ def discover_sprite_textures(
                 f"SpriteAtlas {target['name']} 的输入尺寸发生变化："
                 f"PNG={width}x{height}，报告={target['width']}x{target['height']}"
             )
+        binding = {}
+        if key.casefold() == "1|2048x2048|area_art":
+            from resolve_save_slot_texture import resolve_save_slot_texture
+            binding = resolve_save_slot_texture(ROOT, source, str(target["name"]))
         result.append({
             "name": str(target["name"]),
             "source": source,
@@ -336,6 +397,7 @@ def discover_sprite_textures(
             "semanticKey": key,
             "size": source.stat().st_size,
             "sha256": sha256(source),
+            **binding,
         })
     if not result:
         raise SystemExit("SpriteAtlas 报告中没有精确的 ASTC4x4 匹配项")
@@ -454,10 +516,33 @@ def main() -> int:
     )
     png_index = build_skin_png_index(skin_dir)
     collections = discover_collections(skin_dir)
-    standalone = discover_standalone_textures(generic_report, skin_dir, png_index)
-    sprite_textures = discover_sprite_textures(
+    generic_textures = discover_generic_textures(
+        generic_report, skin_dir, png_index
+    )
+    standalone = [
+        item for item in generic_textures if item["runtimeKind"] == "standalone"
+    ]
+    sprite_backed_generic = [
+        item for item in generic_textures if item["runtimeKind"] == "sprite"
+    ]
+    sys.path.insert(0, str(PORTER_ROOT / "tools"))
+    sprite_textures = sprite_backed_generic + discover_sprite_textures(
         spriteatlas_report, skin_dir, png_index
     )
+    # Initial Sprite assets and SpriteAtlas textures are routed through the
+    # generic SkinLoader hooks. Core/Map need layout-aware runtime PNGs.
+    from build_hero_death_runtime_textures import build_runtime_death_textures
+    runtime_death_assets = build_runtime_death_textures(ROOT, skin_dir)
+    death_sprite_textures = runtime_death_assets["spriteTextures"]
+    death_names = {str(item["name"]) for item in death_sprite_textures}
+    standalone = [item for item in standalone if item["name"] not in death_names]
+    sprite_by_name = {
+        str(item["name"]): item
+        for item in sprite_textures
+        if str(item["name"]) not in death_names
+    }
+    sprite_by_name.update({str(item["name"]): item for item in death_sprite_textures})
+    sprite_textures = list(sprite_by_name.values())
     input_paths = [
         path for atlases in collections.values() for path in atlases.values()
     ]
@@ -515,6 +600,37 @@ def main() -> int:
             "UI.Image.set_sprite 调用点数量发生变化："
             f"期望 {EXPECTED_UI_IMAGE_CALL_COUNT}，实际为 {len(ui_image_call_sites)}"
         )
+    sprite_atlas_get_sprite_call_sites = find_bl_call_sites(
+        main_text, SPRITE_ATLAS_GET_SPRITE_RVA
+    )
+    if len(sprite_atlas_get_sprite_call_sites) != EXPECTED_SPRITE_ATLAS_GET_SPRITE_CALL_COUNT:
+        raise SystemExit(
+            "SpriteAtlas.GetSprite 调用点数量发生变化："
+            f"期望 {EXPECTED_SPRITE_ATLAS_GET_SPRITE_CALL_COUNT}，"
+            f"实际为 {len(sprite_atlas_get_sprite_call_sites)}"
+        )
+    if sprite_atlas_get_sprite_call_sites != [SPRITE_ATLAS_GET_SPRITE_CALL_SITE]:
+        raise SystemExit(
+            "SpriteAtlas.GetSprite 调用点位置发生变化："
+            f"期望 [0x{SPRITE_ATLAS_GET_SPRITE_CALL_SITE:x}]，"
+            f"实际为 {[hex(offset) for offset in sprite_atlas_get_sprite_call_sites]}"
+        )
+    actual_atlas_call = struct.unpack_from(
+        "<I", main_text, sprite_atlas_get_sprite_call_sites[0]
+    )[0]
+    if actual_atlas_call != SPRITE_ATLAS_GET_SPRITE_CALL_INSTRUCTION:
+        raise SystemExit(
+            "SpriteAtlas.GetSprite 调用点指令不匹配："
+            f"期望 0x{SPRITE_ATLAS_GET_SPRITE_CALL_INSTRUCTION:08x}，"
+            f"实际为 0x{actual_atlas_call:08x}"
+        )
+
+    actual_update = struct.unpack_from("<I", main_text, GAME_UPDATE_CALL_SITE)[0]
+    update_calls = find_bl_call_sites(main_text, GAME_UPDATE_ORIGINAL_RVA)
+    if actual_update != GAME_UPDATE_INSTRUCTION or update_calls != [GAME_UPDATE_CALL_SITE]:
+        raise SystemExit(
+            f"GameManager.UpdateEngagement 调用点不匹配：{update_calls}, opcode=0x{actual_update:08x}"
+        )
 
     collection_metadata = {}
     for collection, atlases in collections.items():
@@ -544,6 +660,10 @@ def main() -> int:
     ui_image_hook_offset = find_hook_offset(
         "UIImageSetSpriteExternalHook", SYMBOL_LIST
     )
+    sprite_atlas_hook_offset = find_hook_offset(
+        "SpriteAtlasGetSpriteExternalHook", SYMBOL_LIST
+    )
+    frame_hook_offset = find_hook_offset("GameUpdateExternalHook", SYMBOL_LIST)
     target = MODULE_DELTA + hook_offset
     material_target = MODULE_DELTA + material_hook_offset
     opcode = encode_bl(CALL_SITE_RVA, target)
@@ -558,6 +678,10 @@ def main() -> int:
     ui_image_opcodes = [
         encode_bl(call_site, MODULE_DELTA + ui_image_hook_offset)
         for call_site in ui_image_call_sites
+    ]
+    sprite_atlas_opcodes = [
+        encode_bl(call_site, MODULE_DELTA + sprite_atlas_hook_offset)
+        for call_site in sprite_atlas_get_sprite_call_sites
     ]
     patch_records = [(NSO_HEADER_SIZE + CALL_SITE_RVA, opcode)]
     patch_records.extend(
@@ -574,6 +698,14 @@ def main() -> int:
         (NSO_HEADER_SIZE + call_site, opcode_value)
         for call_site, opcode_value in zip(ui_image_call_sites, ui_image_opcodes)
     )
+    patch_records.extend(
+        (NSO_HEADER_SIZE + call_site, opcode_value)
+        for call_site, opcode_value in zip(
+            sprite_atlas_get_sprite_call_sites, sprite_atlas_opcodes
+        )
+    )
+    frame_opcode = encode_bl(GAME_UPDATE_CALL_SITE, MODULE_DELTA + frame_hook_offset)
+    patch_records.append((NSO_HEADER_SIZE + GAME_UPDATE_CALL_SITE, frame_opcode))
     patch = make_ips32(patch_records)
 
     exefs = output / "atmosphere" / "contents" / "010013C00E930000" / "exefs"
@@ -591,10 +723,53 @@ def main() -> int:
         / "Skin"
     )
     skin_root = skin_base / skin_name
+    bundle_root = (
+        output / "atmosphere" / "contents" / "010013C00E930000" / "romfs"
+        / "Data" / "StreamingAssets" / "aa" / "Switch"
+    ).resolve()
+    romfs_root = (
+        output / "atmosphere" / "contents" / "010013C00E930000" / "romfs"
+    ).resolve()
     nso_path = exefs / "subsdk9"
     npdm_path = exefs / "main.npdm"
     manifest_path = output / "manifest.json"
     readme_path = output / "README.txt"
+
+    # Remove only Bundle files recorded by the previous generated manifest.
+    # This migrates the old output to a runtime-only folder without touching
+    # game originals or unrelated files elsewhere in the workspace.
+    if manifest_path.is_file():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for item in previous.get("staticBundles", []):
+            old_file = (output / item["file"]).resolve()
+            if not old_file.is_relative_to(bundle_root):
+                raise SystemExit(f"旧生成 Bundle 路径越界：{item.get('file')}")
+            if old_file.is_file():
+                old_file.unlink()
+                parent = old_file.parent
+                while parent != bundle_root and parent.is_dir():
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
+    parent = bundle_root
+    while parent != romfs_root and parent.is_dir():
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+    remaining_bundles = sorted(
+        (path for path in bundle_root.rglob("*")
+         if path.is_file() and path.suffix.casefold() == ".bundle"),
+        key=lambda path: str(path).casefold(),
+    ) if bundle_root.is_dir() else []
+    if remaining_bundles:
+        raise SystemExit(
+            "运行时皮肤输出路径仍含 AssetBundle 文件，拒绝生成："
+            + ", ".join(str(path) for path in remaining_bundles)
+        )
 
     # 输出目录是生成的部署包。Mods/Skin 下只保留一个 SilkRuntime 皮肤；暂存前
     # 删除旧生成目录，避免旧皮肤名称意外继续生效。
@@ -651,11 +826,16 @@ def main() -> int:
             "height": item["height"],
             "format": item["format"],
             "semanticKey": item["semanticKey"],
+            "size": destination.stat().st_size,
+            "sha256": sha256(destination),
+            **{key: item[key] for key in ("pathId", "validationReport", "bindingEvidence")
+               if key in item},
         })
-    package_name = "SilkModLoader-runtime-skin" if is_current_output else output.name
+    sprite_aliases = []
+    package_name = skin_name if is_current_output else output.name
     package = {
         "name": package_name,
-        "purpose": "SilkModLoader 运行时皮肤及精确整图 SpriteAtlas 替换",
+        "purpose": "通过 SilkRuntime SkinLoader 加载 PNG 的运行时皮肤目录",
         "programId": "010013C00E930000",
         "gameBuildId": BUILD_ID,
         "testedEnvironment": {
@@ -667,16 +847,26 @@ def main() -> int:
         "loaderNsoSize": nso_path.stat().st_size,
         "collectionCount": len(collections),
         "replacementCount": len(input_paths),
+        "runtimeReplacementCount": len(input_paths),
         "standaloneCount": len(standalone),
         "spriteTextureCount": len(sprite_textures),
+        "spriteTextureAliases": sprite_aliases,
+        "runtimeDeathAssetMapping": {
+            "map": runtime_death_assets["report"].get("mapMapping"),
+            "core": runtime_death_assets["report"].get("coreMapping"),
+            "report": runtime_death_assets["reportPath"].relative_to(ROOT).as_posix(),
+        },
+        "inGameValidation": "待 Switch 游戏内确认；需要 operation=applied 日志",
         "skinName": skin_name,
         "skinInputDirectory": str(skin_dir),
+        "outputKind": "directory",
         "standaloneTextures": standalone_manifest,
         "spriteTextures": sprite_manifest,
         "collections": collection_metadata,
         "skinPath": f"rom:/SilkModLoader/Mods/Skin/{skin_name}",
-        "standaloneInputs": "来自 all-targets.json 的精确名称通用 Texture2D 目标",
-        "spriteAtlasInputs": "来自 spriteatlas-targets.json 的精确 ASTC4x4 整图匹配项",
+        "standaloneInputs": "来自 all-targets.json 的通用 Texture2D 目标，按运行时引用类型分类",
+        "spriteBackedGenericInputs": sorted(SPRITE_BACKED_GENERIC_TEXTURE_NAMES),
+        "spriteAtlasInputs": "来自 spriteatlas-targets.json 的精确目标，以及按 RenderDataKey 重排的运行时整图 PNG",
         "callSiteRva": f"0x{CALL_SITE_RVA:x}",
         "expectedInstruction": f"0x{EXPECTED_INSTRUCTION:08x}",
         "moduleDelta": f"0x{MODULE_DELTA:x}",
@@ -690,6 +880,26 @@ def main() -> int:
         "spriteRendererHookOffset": f"0x{sprite_renderer_hook_offset:x}",
         "uiImageCallSites": [f"0x{offset:x}" for offset in ui_image_call_sites],
         "uiImageHookOffset": f"0x{ui_image_hook_offset:x}",
+        "spriteAtlasGetSpriteCallSites": [
+            f"0x{offset:x}" for offset in sprite_atlas_get_sprite_call_sites
+        ],
+        "spriteAtlasGetSpriteHookOffset": f"0x{sprite_atlas_hook_offset:x}",
+        "loadedTextureDiscovery": {
+            "method": "Resources.FindObjectsOfTypeAll(Texture2D) on Unity main thread",
+            "callSiteRva": f"0x{GAME_UPDATE_CALL_SITE:x}",
+            "originalRva": f"0x{GAME_UPDATE_ORIGINAL_RVA:x}",
+            "hookOffset": f"0x{frame_hook_offset:x}",
+            "patchInstruction": f"0x{frame_opcode:08x}",
+            "intervalSeconds": 1,
+            "maxObjectsPerFrame": 64,
+            "maxNewPngPerFrame": 1,
+            "snapshotGcHandle": "Normal",
+            "identityCache": "native pointer + instance ID; linear probing; two scan generations",
+            "cacheEntriesPerGeneration": 8192,
+            "scanLogPolicy": "first scan, applied textures, or errors only",
+            "retryIntervalSeconds": 5,
+            "hardwareValidation": "pending",
+        },
         "patchSha256": sha256(patch_path),
         "npdm": {
             "source": "SilkRuntime/output/main.npdm",
@@ -709,19 +919,35 @@ def main() -> int:
 FC9EA4CCC955D5799F37752B2D730B31。将目录内容复制到 SD 卡根目录即可。包内包含
 main.npdm、subsdk9、{len(patch_records)} 条启动前 IPS32 重定向，以及包含 {len(collections)} 个
 Collection 目录的 LayeredFS romfs Skin/{skin_name}，其中有
-{len(input_paths) - len(standalone) - len(sprite_textures)} 张 Atlas PNG、
-{len(standalone)} 张独立 Texture2D PNG，以及 {len(sprite_textures)} 张精确整图
-SpriteAtlas 纹理 PNG。
+{sum(len(atlases) for atlases in collections.values())} 张 TK2D Atlas PNG、
+{len(standalone)} 张 Material 路径 Texture2D PNG，以及 {len(sprite_textures)} 张
+Sprite 路径纹理 PNG（Sprite 引用的 Texture2D 与精确匹配的 SpriteAtlas 整图）。
+日常构建只输出当前文件夹。压缩包仅在明确制作 release 时，使用专用 release 目录生成。
 
-已验证成功的环境：
+SkinLoader 在 Unity 主线程定期枚举已经加载的 Texture2D，并分帧匹配皮肤 PNG。
+这条通用路径覆盖预先绑定在 Prefab、材质或 Sprite 中、没有触发 setter 的纹理。
+每轮枚举结果由 Normal GCHandle 保护；最多检查 64 个对象/帧、应用 1 张新 PNG/帧。
+枚举和单张 LoadImage 不能拆分，实际帧耗时仍需 Switch 验证。
+Sprite、Material、Atlas.GetSprite Hook 和扫描器共用按实际纹理名查找及去重逻辑。
+Core 与地图图集在离线阶段按 Sprite 元数据生成同尺寸 PNG，运行时由 SkinLoader
+通过 Unity LoadImage 应用。本目录不包含任何 AssetBundle。
+Core 的目标贴图按实际网格范围写入；构建检查非目标 Sprite 与原版相同。
+此前扫描机制已有 Switch 应用日志与用户画面确认。本次缓存/日志优化尚待真机复核。
+正常扫描仅在首次、有实际应用或异常时输出摘要；普通扫描保持安静。
+存档选择页的 Area_Art 图标按当前原始资源中的 Texture2D 名称输出 PNG；构建时
+先核对源图的未修改区域和当前 Switch Sprite 网格，避免继续沿用过期报告中的名称。
+该名称修复尚待 Switch 确认；具体外观以皮肤源图为准，源图未改的图标仍保持原样。
+
+此前基线验证成功的环境（不代表本次修改已验证）：
+
 - 游戏版本：ver. 1.0.30000
 - NS 系统版本：22.5.0
 - Atmosphère（AMS）版本：1.11.2
 
-此包使用 Switch 格式 48（ASTC 4x4）。SpriteRenderer.set_sprite 和
-UI.Image.set_sprite 会先调用原始 setter，再解析 Sprite.get_texture 并匹配 Unity
-对象名。`standalone/` 和 `sprite/` 下的文件名使用确定性编码，不需要 skin.json
-或 active.txt。当前输出只包含精确的 ASTC4x4 整图 SpriteAtlas 匹配项。
+运行时 PNG 匹配 Switch 格式 4（RGBA32）、12（DXT5/BC3）、48（ASTC 4x4）或
+50（ASTC 6x6）。纹理按实际 Unity 对象名精确匹配，统一先查 standalone/，再查
+sprite/；同名多实例按 native 地址和 instance ID 区分。不同名字的整图不能只凭
+Sprite 名和相同尺寸套用，避免把不兼容的 UV 布局写入当前纹理。
 
 此包包含由 SilkRuntime 生成、经过 H1e 验证，并具备运行时 Hook 所需进程内存 SVC
 能力的 main.npdm。不要将它与游戏原版 main.npdm 或其他 Loader 模板 NPDM 混用。
@@ -730,11 +956,10 @@ UI.Image.set_sprite 会先调用原始 setter，再解析 Sprite.get_texture 并
 如需捕获 SVC，请在工作区根目录执行：
   .\\SilkRuntime\\tools\\switch_gdb\\start-silkmodloader.ps1 -SwitchIp 192.168.5.7
 等待 GDB 就绪后启动游戏。脚本停在 Build ID 行时输入 `continue`。预期会看到：
-  [Skin] Unity Texture2D and RomFS reader bindings accepted ... directory mode enabled
-  [Skin] collection=Knight ... replacements=4
+  [Skin] Unity Texture2D and RomFS reader bindings accepted ... skin root=...
   [Skin] Knight atlas0 operation=applied
-  [Skin] standalone name=... operation=applied
-  [Skin] sprite-texture name=... operation=applied
+  [Skin] texture=Hornet_death_pieces_0000s_0001_6 observer=discovery source=sprite operation=applied
+  [SkinScan] round=1 textures=... cacheMisses=... applied=... retry=0
 
 其他 Collection 会在初始化时输出对应日志。如果某项没有 applied，请停止测试并
 保留 SVC 输出及 Atmosphère 崩溃报告。删除 exefs_patches 文件可以恢复未重定向的
@@ -748,9 +973,11 @@ UI.Image.set_sprite 会先调用原始 setter，再解析 Sprite.get_texture 并
     print(f"Material Hook 偏移：0x{material_hook_offset:x}")
     print(f"SpriteRenderer Hook 偏移：0x{sprite_renderer_hook_offset:x}")
     print(f"UI Image Hook 偏移：0x{ui_image_hook_offset:x}")
+    print(f"Frame Hook 偏移：0x{frame_hook_offset:x}，IPS32 记录：{len(patch_records)}")
     print(f"TK2D 补丁指令：0x{opcode:08x}")
     print(f"Material 补丁指令：{[f'0x{value:08x}' for value in material_opcodes]}")
     print(f"Collection：{len(collections)}，Atlas PNG：{len(input_paths) - len(standalone) - len(sprite_textures)}，独立 PNG：{len(standalone)}，Sprite PNG：{len(sprite_textures)}")
+    print(f"死亡资源运行时 Sprite PNG：{len(death_sprite_textures)}")
     return 0
 
 

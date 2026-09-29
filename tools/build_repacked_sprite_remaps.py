@@ -10,8 +10,8 @@ from pathlib import Path
 
 import UnityPy
 from PIL import Image, ImageChops, ImageStat
-
-from rebuild_repacked_bundle import patch_bundle
+from UnityPy.export.SpriteHelper import mask_sprite
+from UnityPy.helpers.MeshHelper import MeshHandler
 
 
 PORTER_ROOT = Path(__file__).resolve().parents[1]
@@ -22,13 +22,11 @@ DEFAULT_WORKSPACE = (
     else PORTER_ROOT
 )
 ROOT = Path(os.environ.get("SILK_WORKSPACE_ROOT", DEFAULT_WORKSPACE)).resolve()
-TITLE_ID = "010013C00E930000"
 PC_ROOT = ROOT / "samples" / "pc-original"
 SWITCH_ROOT = ROOT / "romfs" / "Data" / "StreamingAssets" / "aa" / "Switch" / "atlases_assets_assets" / "sprites" / "_atlases"
 SKIN_ROOT = ROOT / "pc-mods" / "丝之歌x星见雅皮肤2.0" / "XJY-Zycl_dhth" / "Texture2D"
 OUTPUT_ROOT = ROOT / "output" / "diagnostics" / "repacked-sprite-remaps"
 REPORT = ROOT / "output" / "reports" / "runtime-repacked-sprite-textures.json"
-STATIC_ROOT = ROOT / "dist" / "diagnostics" / "repacked-sprite-uv-remaps"
 
 SOURCE_FILES = {
     "heart_deaths": ["sactx-0-2048x2048-DXT5_BC3-Heart_Deaths-9bc2e886.png"],
@@ -117,9 +115,14 @@ def rms(a: Image.Image, b: Image.Image) -> float:
     return (sum(value * value for value in values) / 4) ** 0.5
 
 
-def validate_reopened(destination: Path, expected_display: dict) -> dict[str, object]:
+def validate_reopened(
+    destination: Path,
+    expected_display: dict,
+    expected_alphas: dict | None = None,
+) -> dict[str, object]:
     _env, _atlas_obj, _atlas, _textures, sprites, _render = load_atlas(destination)
     values = []
+    alpha_values = []
     for key, expected in expected_display.items():
         sprite = sprites[key].read()
         if sprite.image.size != expected.size:
@@ -129,18 +132,42 @@ def validate_reopened(destination: Path, expected_display: dict) -> dict[str, ob
         visible_got = Image.composite(got, Image.new("RGBA", got.size), mask)
         visible_expected = Image.composite(expected, Image.new("RGBA", expected.size), mask)
         values.append(rms(visible_got, visible_expected))
+        expected_alpha = (expected_alphas or {}).get(key)
+        if expected_alpha is not None:
+            expected_alpha = expected_alpha.convert("L")
+            if expected_alpha.size != got.size:
+                raise ValueError(f"{sprite.m_Name}：alpha 期望尺寸与重新打开的 Sprite 不一致")
+            actual_alpha = got.getchannel("A")
+            alpha_diff = ImageChops.difference(actual_alpha, expected_alpha)
+            alpha_rms = ImageStat.Stat(alpha_diff).rms[0]
+            hard_opaque_missing = sum(
+                expected_value >= 128 and actual_value < 16
+                for expected_value, actual_value in zip(
+                    expected_alpha.getdata(), actual_alpha.getdata()
+                )
+            )
+            alpha_values.append({
+                "name": sprite.m_Name,
+                "alphaRms": alpha_rms,
+                "expectedVisiblePixels": sum(value > 0 for value in expected_alpha.getdata()),
+                "actualVisiblePixels": sum(value > 0 for value in actual_alpha.getdata()),
+                "hardOpaqueMissingPixels": hard_opaque_missing,
+            })
     return {
         "spriteCount": len(values),
         "maskedRmsMean": sum(values) / len(values) if values else 0,
         "maskedRmsMax": max(values) if values else 0,
         "maskedRmsUnder10": sum(value < 10 for value in values),
+        "alphaValidation": alpha_values,
+        "alphaRmsMax": max((row["alphaRms"] for row in alpha_values), default=0),
+        "hardOpaqueMissingPixels": sum(row["hardOpaqueMissingPixels"] for row in alpha_values),
     }
 
 
-def load_source_images(name: str) -> dict[int, Image.Image]:
+def load_source_images(name: str, skin_root: Path = SKIN_ROOT) -> dict[int, Image.Image]:
     result: dict[int, Image.Image] = {}
     for filename in SOURCE_FILES[name]:
-        path = SKIN_ROOT / filename
+        path = skin_root / filename
         if not path.is_file():
             raise SystemExit(f"皮肤源文件不存在：{path}")
         match = INDEX_RE.match(filename)
@@ -150,7 +177,28 @@ def load_source_images(name: str) -> dict[int, Image.Image]:
     return result
 
 
-def build_atlas(name: str) -> dict[str, object]:
+def tight_mesh_mask(sprite_obj):
+    sprite = sprite_obj.read()
+    mesh = MeshHandler(sprite.m_RD, sprite.object_reader.version)
+    mesh.process()
+    if not mesh.m_Vertices or not any(mesh.get_triangles()):
+        raise ValueError(f"{sprite.m_Name}：Sprite 网格缺少顶点或三角形")
+    opaque = Image.new("RGBA", sprite.image.size, (255, 255, 255, 255))
+    coverage = mask_sprite(sprite, mesh, opaque).getchannel("A")
+    coverage = coverage.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    actual_alpha = sprite.image.convert("RGBA").getchannel("A")
+    outside = ImageChops.multiply(actual_alpha, ImageChops.invert(coverage))
+    if outside.getbbox() is not None:
+        raise ValueError(f"{sprite.m_Name}：解码 Sprite alpha 超出网格范围")
+    return sprite, mesh, coverage
+
+
+def build_atlas(
+    name: str,
+    skin_root: Path = SKIN_ROOT,
+    output_root: Path = OUTPUT_ROOT,
+    sprite_names: set[str] | None = None,
+) -> dict[str, object]:
     pc_path = PC_ROOT / f"{name}.spriteatlas.bundle"
     switch_path = SWITCH_ROOT / f"{name}.spriteatlas.bundle"
     if not pc_path.is_file() or not switch_path.is_file():
@@ -160,7 +208,7 @@ def build_atlas(name: str) -> dict[str, object]:
     if set(pc_sprites) != set(sw_sprites) or set(pc_render) != set(sw_render):
         raise ValueError(f"{name}：PC/Switch 的 RenderDataKey 集合不同")
 
-    source_images = load_source_images(name)
+    source_images = load_source_images(name, Path(skin_root).resolve())
     target_canvases: dict[int, Image.Image] = {}
     target_objects: dict[int, object] = {}
     target_names: dict[int, str] = {}
@@ -171,6 +219,9 @@ def build_atlas(name: str) -> dict[str, object]:
         target_names[path_id] = texture.m_Name
 
     expected_display: dict[object, Image.Image] = {}
+    expected_masks: dict[object, Image.Image] = {}
+    alpha_validation: dict[object, Image.Image] = {}
+    validation_targets: dict[object, tuple[int, tuple[int, int, int, int], int]] = {}
     rows: list[dict[str, object]] = []
     source_counts: dict[int, int] = {}
     skipped_source_counts: dict[int, int] = {}
@@ -182,6 +233,8 @@ def build_atlas(name: str) -> dict[str, object]:
         sw_sprite = sw_sprites[key].read()
         if pc_sprite.m_Name != sw_sprite.m_Name:
             raise ValueError(f"{name}：RenderDataKey {key} 的名称不匹配")
+        if sprite_names is not None and sw_sprite.m_Name not in sprite_names:
+            continue
         pc_texture = pc_data.texture.deref_parse_as_object()
         pc_index = texture_index(pc_texture)
         source_image = source_images.get(pc_index)
@@ -207,11 +260,38 @@ def build_atlas(name: str) -> dict[str, object]:
         if source_display.size != target_size:
             source_display = source_display.resize(target_size, Image.Resampling.LANCZOS)
         expected_display[key] = source_display.copy()
-        target_crop = inverse_rotate(source_display, sw_data.settingsRaw)
-        target_mask = inverse_rotate(sw_sprite.image.getchannel("A"), sw_data.settingsRaw)
+        source_display_copy = source_display.copy()
+        if sw_sprite.m_Name == "Hornet_death_pieces_0000s_0007_back_thread":
+            pc_mesh_sprite, pc_mesh, pc_mask = tight_mesh_mask(pc_sprites[key])
+            sw_mesh_sprite, sw_mesh, sw_mask = tight_mesh_mask(sw_sprites[key])
+            if (pc_mesh.m_Vertices != sw_mesh.m_Vertices or
+                    pc_mesh_sprite.m_PixelsToUnits != sw_mesh_sprite.m_PixelsToUnits or
+                    pc_mask.size != sw_mask.size or pc_mask.tobytes() != sw_mask.tobytes()):
+                raise ValueError(f"{name}/{sw_sprite.m_Name}：PC/Switch Sprite 网格不一致")
+            target_mask_display = sw_mask
+            expected_alpha = ImageChops.multiply(
+                source_display_copy.getchannel("A"), target_mask_display
+            )
+            alpha_validation[key] = expected_alpha
+            rows_mask_method = "SpriteRenderData tight-mesh polygon"
+        elif sprite_names is not None:
+            _sprite, _mesh, target_mask_display = tight_mesh_mask(sw_sprites[key])
+            rows_mask_method = "SpriteRenderData tight-mesh polygon"
+        else:
+            target_mask_display = sw_sprite.image.getchannel("A")
+            rows_mask_method = "original Switch Sprite alpha"
+        target_crop = inverse_rotate(source_display_copy, sw_data.settingsRaw)
+        target_mask = inverse_rotate(target_mask_display, sw_data.settingsRaw)
         if target_crop.size != target_mask.size:
             raise ValueError(f"{name}/{sw_sprite.m_Name}：补丁与遮罩尺寸不匹配")
-        target_canvases[target_path_id].paste(target_crop, (sw_box[0], sw_box[1]), target_mask)
+        # Tight-packed sprites may share rectangular bounds. Copy all RGBA
+        # channels under the target geometry, never its entire bounding box.
+        # Using geometry rather than old alpha permits newly visible skin pixels.
+        target_canvases[target_path_id].paste(
+            target_crop, (sw_box[0], sw_box[1]), target_mask
+        )
+        expected_masks[key] = target_mask_display
+        validation_targets[key] = (target_path_id, sw_box, int(sw_data.settingsRaw))
         rows.append({
             "name": sw_sprite.m_Name,
             "renderDataKey": [str(key[0]), key[1]],
@@ -224,9 +304,25 @@ def build_atlas(name: str) -> dict[str, object]:
             "sourceSettingsRaw": int(pc_data.settingsRaw),
             "targetSettingsRaw": int(sw_data.settingsRaw),
             "resized": list(source_display.size),
+            "maskMethod": rows_mask_method,
         })
 
-    output_dir = OUTPUT_ROOT / name
+    if sprite_names is not None:
+        boxes_by_texture: dict[int, list[tuple[int, int, int, int, object]]] = {}
+        for key, (path_id, box, _settings_raw) in validation_targets.items():
+            boxes_by_texture.setdefault(path_id, []).append((*box, key))
+        for boxes in boxes_by_texture.values():
+            for index, (left, top, right, bottom, key) in enumerate(boxes):
+                for other_left, other_top, other_right, other_bottom, other_key in boxes[index + 1:]:
+                    if (left < other_right and other_left < right and
+                            top < other_bottom and other_top < bottom):
+                        raise ValueError(
+                            f"{name}：Sprite 目标矩形重叠，不能安全生成整图 PNG："
+                            f"{sw_sprites[key].read().m_Name} 与 "
+                            f"{sw_sprites[other_key].read().m_Name}"
+                        )
+
+    output_dir = Path(output_root).resolve() / name
     output_dir.mkdir(parents=True, exist_ok=True)
     generated = []
     for path_id, target_name in sorted(target_names.items(), key=lambda item: item[1].casefold()):
@@ -248,21 +344,108 @@ def build_atlas(name: str) -> dict[str, object]:
         })
     if not generated:
         raise ValueError(f"{name}：没有目标纹理接收到皮肤补丁")
+    if sprite_names is not None:
+        found_names = {str(row["name"]) for row in rows}
+        missing_names = sprite_names - found_names
+        if missing_names:
+            raise ValueError(
+                f"{name}：缺少要求的 Sprite 重排：{', '.join(sorted(missing_names))}"
+            )
 
-    static_result = patch_bundle(
-        switch_path,
-        [
-            {"pathId": item["pathId"], "png": item["png"], "source": "经过验证的逐 Sprite UV 区域重排", "resize": False}
-            for item in generated
-        ],
-        switch_root=ROOT / "romfs" / "Data" / "StreamingAssets" / "aa" / "Switch",
-        destination_root=STATIC_ROOT / "atmosphere" / "contents" / TITLE_ID / "romfs" / "Data" / "StreamingAssets" / "aa" / "Switch",
-    )
-    validation = validate_reopened(Path(static_result["destination"]), expected_display)
-    validation["nonTargetResourceBytesUnchanged"] = bool(static_result["nonTargetResourceBytesUnchanged"])
-    validation["bundleReopenVerified"] = True
+    color_errors = []
+    alpha_errors = []
+    original_canvases = {
+        path_id: obj.read().image.convert("RGBA").copy()
+        for path_id, obj in sw_textures.items()
+    }
+    region_masks = {
+        path_id: Image.new("L", canvas.size, 0)
+        for path_id, canvas in target_canvases.items()
+    }
+    for key, expected in expected_display.items():
+        path_id, box, settings_raw = validation_targets[key]
+        if sprite_names is None:
+            region_masks[path_id].paste(255, box)
+        else:
+            packed_mask = inverse_rotate(expected_masks[key], settings_raw)
+            mask_canvas = Image.new("L", region_masks[path_id].size, 0)
+            mask_canvas.paste(packed_mask, box[:2])
+            region_masks[path_id] = ImageChops.lighter(region_masks[path_id], mask_canvas)
+        got = rotate(target_canvases[path_id].crop(box), settings_raw).convert("RGBA")
+        mask = expected_masks[key]
+        visible_got = Image.composite(got, Image.new("RGBA", got.size), mask)
+        visible_expected = Image.composite(expected, Image.new("RGBA", expected.size), mask)
+        color_error = rms(visible_got, visible_expected)
+        color_errors.append(color_error)
+        if color_error > 10:
+            raise ValueError(f"{name}/{sw_sprites[key].read().m_Name}：运行时图集 PNG 重映射 RMS 超限 {color_error}")
+        if key in alpha_validation:
+            actual_alpha = ImageChops.multiply(got.getchannel("A"), mask)
+            expected_alpha = alpha_validation[key]
+            alpha_error = ImageStat.Stat(ImageChops.difference(actual_alpha, expected_alpha)).rms[0]
+            alpha_errors.append(alpha_error)
+            hard_missing = sum(
+                expected_value >= 128 and actual_value < 16
+                for expected_value, actual_value in zip(expected_alpha.getdata(), actual_alpha.getdata())
+            )
+            if alpha_error > 10 or hard_missing:
+                raise ValueError(f"{name}/{sw_sprites[key].read().m_Name}：运行时图集 alpha 重映射失败 RMS={alpha_error} missing={hard_missing}")
+    unchanged_pixel_counts = {}
+    for path_id, canvas in target_canvases.items():
+        safe_name = re.sub(r'[<>:"/\\|?*]', "_", target_names[path_id])
+        saved = Image.open(output_dir / f"{safe_name}.png").convert("RGBA")
+        if saved.size != canvas.size or ImageChops.difference(saved, canvas).getbbox(alpha_only=False) is not None:
+            raise ValueError(f"{name}/{target_names[path_id]}：保存的运行时 PNG 与构建图集不一致")
+        outside = ImageChops.invert(region_masks[path_id])
+        changed = ImageChops.difference(original_canvases[path_id], canvas)
+        outside_changes = Image.composite(changed, Image.new("RGBA", canvas.size), outside)
+        if outside_changes.getbbox(alpha_only=False) is not None:
+            raise ValueError(f"{name}/{target_names[path_id]}：图集目标覆盖范围以外像素发生变化")
+        unchanged_pixel_counts[target_names[path_id]] = (
+            canvas.width * canvas.height - sum(value > 0 for value in region_masks[path_id].getdata())
+        )
+    non_target_checked = 0
+    unresolved_checked = 0
+    if sprite_names is not None:
+        before_sprites = {
+            key: obj.read().image.convert("RGBA").copy()
+            for key, obj in sw_sprites.items() if key not in expected_display
+        }
+        # Re-render through the original meshes using only a decoded-image
+        # cache override. No serialized object or AssetBundle is written.
+        flipped = {path_id: canvas.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                   for path_id, canvas in target_canvases.items()}
+        for obj in sw_sprites.values():
+            obj.assets_file._cache.update(flipped)
+        for key, before in before_sprites.items():
+            after = sw_sprites[key].read().image.convert("RGBA")
+            if ImageChops.difference(before, after).getbbox(alpha_only=False) is not None:
+                raise ValueError(f"{name}：非目标 Sprite 被更改：{sw_sprites[key].read().m_Name}")
+            non_target_checked += 1
+        for key in set(sw_render) - set(sw_sprites):
+            data = sw_render[key]
+            path_id = data.texture.path_id
+            canvas = target_canvases[path_id]
+            box = texture_box(data.textureRect, canvas.height)
+            difference = ImageChops.difference(original_canvases[path_id].crop(box), canvas.crop(box))
+            if difference.getbbox(alpha_only=False) is not None:
+                raise ValueError(f"{name}：没有 Sprite 对象的 RenderData 区域被更改：{key}")
+            unresolved_checked += 1
+    validation = {
+        "spriteCount": len(color_errors),
+        "maskedRmsMean": sum(color_errors) / len(color_errors) if color_errors else 0,
+        "maskedRmsMax": max(color_errors, default=0),
+        "maskedRmsUnder10": sum(value < 10 for value in color_errors),
+        "alphaRmsMax": max(alpha_errors, default=0),
+        "nonTargetPixelsUnchanged": True,
+        "nonTargetSpritesChecked": non_target_checked,
+        "renderEntriesWithoutSpriteChecked": unresolved_checked,
+        "regionValidation": "tight mesh geometry" if sprite_names is not None else "rectangles",
+        "pngRoundTripExact": True,
+        "unchangedPixelCountByTexture": unchanged_pixel_counts,
+    }
     print(
-        f"{name}：已补丁 Sprite={len(rows)}，目标纹理={len(generated)}，"
+        f"{name}：已生成运行时 Sprite 纹理={len(rows)}，目标纹理={len(generated)}，"
         f"RMS 均值={validation['maskedRmsMean']:.3f}，低于 10={validation['maskedRmsUnder10']}，"
         f"源纹理计数={source_counts}，跳过={skipped_source_counts}"
     )
@@ -270,56 +453,20 @@ def build_atlas(name: str) -> dict[str, object]:
         "name": name,
         "pcBundle": str(pc_path),
         "switchBundle": str(switch_path),
-        "sourceTextures": [str(SKIN_ROOT / item) for item in SOURCE_FILES[name]],
+        "sourceTextures": [str(Path(skin_root).resolve() / item) for item in SOURCE_FILES[name]],
         "spriteCount": len(rows),
         "generated": generated,
         "sourceSpriteCounts": source_counts,
         "skippedSourceSpriteCounts": skipped_source_counts,
         "targetSpriteCounts": target_counts,
         "rows": rows,
-        "bundle": static_result,
         "validation": validation,
     }
 
 
 def main() -> int:
     results = [build_atlas(name) for name in SOURCE_FILES]
-    entries = [
-        {
-            "semanticKey": "0|4096x4096|hornet",
-            "targetName": "sactx-0-4096x4096-ASTC 4x4-Hornet-5e00c913",
-            "sourcePng": str(ROOT / "output" / "diagnostics" / "hornet-sprite-uv-remap.png"),
-            "dimensions": [4096, 4096],
-            "format": 48,
-            "sourceKind": "经过验证的离线逐 Sprite UV 区域重排",
-            "evidenceReport": str(ROOT / "output" / "reports" / "hornet-sprite-uv-remap-build.json"),
-            "validation": {
-                "spriteCount": 282,
-                "maskedRmsMean": 3.3142935003310754,
-                "maskedRmsMax": 11.257624769395406,
-                "maskedRmsUnder10": 280,
-                "bundleReopenVerified": True,
-                "nonTargetResourceBytesUnchanged": True,
-            },
-        },
-        {
-            "semanticKey": "0|2048x2048|tools",
-            "targetName": "sactx-0-2048x1024-ASTC 6x6-Tools-a7143009",
-            "sourcePng": str(ROOT / "output" / "diagnostics" / "tools-sprite-uv-remap.png"),
-            "dimensions": [2048, 1024],
-            "format": 50,
-            "sourceKind": "经过验证的离线逐 Sprite UV 区域重排",
-            "evidenceReport": str(ROOT / "output" / "reports" / "test-o-tools-package.json"),
-            "validation": {
-                "spriteCount": 97,
-                "maskedRmsMean": 3.5707125140918947,
-                "maskedRmsMax": 10.728267204441181,
-                "maskedRmsUnder10": 96,
-                "bundleReopenVerified": True,
-                "nonTargetResourceBytesUnchanged": True,
-            },
-        },
-    ]
+    entries = []
     for result in results:
         for generated in result["generated"]:
             entries.append({
@@ -328,14 +475,13 @@ def main() -> int:
                 "sourcePng": generated["png"],
                 "dimensions": [generated["width"], generated["height"]],
                 "format": generated["format"],
-                "sourceKind": "经过验证的离线逐 Sprite UV 区域重排",
+                "sourceKind": "经 RenderDataKey 映射生成的运行时 PNG",
                 "evidenceReport": str(REPORT),
                 "validation": result["validation"],
             })
     report = {
-        "version": 2,
-        "titleId": TITLE_ID,
-        "description": "根据 PC/Switch SpriteAtlas RenderDataKey 元数据生成的经过验证的离线逐 Sprite UV 重排；运行时仍使用整图替换。",
+        "version": 3,
+        "description": "根据 PC/Switch SpriteAtlas RenderDataKey 元数据生成与 SilkRuntime SpriteTexture Hook 配套的 PNG；不重建或输出 AssetBundle。",
         "atlases": results,
         "entries": entries,
     }

@@ -28,8 +28,7 @@ SilkRuntime/output/build/SilkModLoader.lst
 - 统一输出目录：`SilkPorter/output/`
 - 皮肤根目录：`romfs/SilkModLoader/Mods/Skin/<皮肤目录名>/`
 - 激活方式：当前 Loader 发现 `Skin/` 下的皮肤目录后直接读取
-- `skin.json`：不生成
-- `active.txt`：不生成
+
 
 ## SilkPorter 的处理流程
 
@@ -215,9 +214,11 @@ pc-mods/
    output/reports/spriteatlas-targets.json
    ```
 
-5. 之后日常转换只需要保留这些报告、`main/text.bin`、`pc-mods/`、
-   `SilkPorter/` 和已经构建的 `SilkRuntime/`。原始 `romfs/`、`samples/` 可以
-   放在离线备份中，不必随日常工作目录携带。
+5. 日常运行时 PNG 转换需要这些报告、`main/text.bin`、`pc-mods/`、
+   `SilkPorter/` 和已经构建的 `SilkRuntime/`。如果皮肤包含死亡茧或地图死亡
+   图标资源，还要保留对应原始 `romfs/` Bundle；处理茧内部与背后丝线时还需
+   `samples/pc-original/core.spriteatlas.bundle`。静态结果缓存会重新检查输入
+   和生成物哈希，不能用旧缓存替代不同版本的原始资源。
 
 该获取方案只描述资源的本地提取和整理，不提供或分发游戏文件本身。不同游戏版本
 不能混用；如果 `main` 的 Build ID、Bundle 内容或 PC 资源版本不一致，必须重新
@@ -341,8 +342,9 @@ uv run --with-requirements SilkPorter/requirements.txt --python 3.12 `
 | 资源类别 | 匹配依据 |
 | --- | --- |
 | TK2D 集合 | 集合名称、图集索引及目标尺寸 |
-| 独立 Texture2D | 精确 Unity 对象名及已确认尺寸 |
-| SpriteAtlas | PC/Switch RenderDataKey、Sprite 名称及纹理区域 |
+| Material 使用的 Texture2D | 精确 Unity 对象名及已确认尺寸，放入 `standalone/` |
+| Sprite 引用的 Texture2D | 根据 Switch 序列化引用确认对象关系，精确匹配对象名和尺寸，放入 `sprite/` |
+| SpriteAtlas | PC/Switch RenderDataKey、Sprite 名称及纹理区域，整张替换纹理放入 `sprite/` |
 
 PC PNG 必须经过目标尺寸、格式和运行时访问路径验证后，才能加入部署清单。
 排布不同的 SpriteAtlas 必须完成离线重排；未确认目标对象或缩放行为的辅助纹理
@@ -357,7 +359,7 @@ PC 与 Switch 的部分 SpriteAtlas 采用不同排布，直接覆盖整张图�
 2. 使用 RenderDataKey 和稳定名称匹配 Sprite；
 3. 根据旋转及 pivot 规则提取 PC Sprite 区域；
 4. 将提取区域写入符合 Switch 布局和尺寸的画布；
-5. 重新打开涉及 Bundle 重建的产物，检查尺寸、编码格式及非目标资源；
+5. 重新打开生成的同尺寸 PNG，检查 Sprite 显示区域和非目标像素；
 6. 将生成的 PNG 作为完整纹理替换输入写入部署目录。
 
 缺少可靠 PC 源纹理的区域保留 Switch 原始内容。重排在离线阶段完成，运行时
@@ -372,18 +374,20 @@ Skin/
 └── <Skin Name>/
     ├── <Collection Name>/
     │   └── atlas0.png
-    ├── standalone/
+    ├── standalone/                 # Material.set_mainTexture 路径
     │   └── <encoded Unity Texture2D name>.png
-    └── sprite/
+    └── sprite/                     # Sprite.get_texture 路径及 SpriteAtlas 整图
         └── <encoded Switch Texture2D name>.png
 ```
 
 `Skin/` 下只放一个由本次构建生成的皮肤目录；目录名可任意命名。集合目录名和
 `atlasN.png` 编号必须与 Switch 的 TK2D 集合一致。
 `standalone/` 和 `sprite/` 中的文件名由 SilkPorter 使用与 Loader 相同的可逆编码
-生成，避免 Unity 名称中的特殊字符破坏 SD 路径。
+生成，避免 Unity 名称中的特殊字符破坏 SD 路径。Sprite、Material 和已加载纹理扫描
+统一先查 `standalone/`，再查 `sprite/`；按实际纹理名精确匹配，并共用对象身份去重。
 
 `active.txt` 属于 PC Mod 的启用标记，Switch 端不读取，也不会写入输出包。
+
 
 
 ## 依赖与许可证

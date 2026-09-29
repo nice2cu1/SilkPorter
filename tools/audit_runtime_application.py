@@ -28,7 +28,7 @@ SKIN_ROOT = (
 MANIFEST = CURRENT_PACKAGE / "manifest.json"
 ALL_TARGETS = ROOT / "output" / "reports" / "all-targets.json"
 SPRITE_TARGETS = ROOT / "output" / "reports" / "spriteatlas-targets.json"
-STATIC_BUILD = ROOT / "output" / "reports" / "xingjianya-all-build.json"
+RESIZED_BUILD = ROOT / "output" / "reports" / "xingjianya-all-build.json"
 OUT_JSON = ROOT / "output" / "reports" / "runtime-application-audit.json"
 OUT_MD = ROOT / "output" / "reports" / "runtime-application-audit.md"
 
@@ -50,7 +50,7 @@ def walk_refs(value, path=""):
         for key, child in value.items():
             child_path = f"{path}.{key}" if path else key
             yield from walk_refs(child, child_path)
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             yield from walk_refs(child, f"{path}[{index}]")
 
@@ -73,8 +73,8 @@ def target_rows() -> dict[str, dict]:
                 "sourceKind": "精确 SpriteAtlas Texture2D 目标",
             }
 
-    static = load_json(STATIC_BUILD)
-    for bundle in static.get("bundles", []):
+    resized = load_json(RESIZED_BUILD)
+    for bundle in resized.get("bundles", []):
         for row in bundle.get("textures", []):
             name = str(row.get("name", ""))
             if not name or not row.get("resized"):
@@ -87,7 +87,7 @@ def target_rows() -> dict[str, dict]:
                 "height": int(row["targetSize"][1]),
                 "inputSize": row.get("inputSize"),
                 "format": row.get("format"),
-                "sourceKind": "缩放 Texture2D 目标",
+                "sourceKind": "可通过运行时 Hook 加载的适配尺寸目标",
             }
     return result
 
@@ -95,7 +95,7 @@ def target_rows() -> dict[str, dict]:
 def find_refs(bundle: str, targets: list[dict]) -> dict[str, dict]:
     UnityPy.config.FALLBACK_UNITY_VERSION = "6000.0.50f1"
     env = UnityPy.load(bundle)
-    objects = list(env.objects)
+    target_objects = list(env.objects)
     target_ids = {int(row["pathId"]): row for row in targets}
     rows = {
         str(row["name"]): {
@@ -105,8 +105,17 @@ def find_refs(bundle: str, targets: list[dict]) -> dict[str, dict]:
         }
         for row in targets
     }
+    # A texture's materials can be serialized in another Bundle. Match the
+    # resolved SerializedFile identity as well as PathID, not just fileID=0.
+    identities = {(obj.assets_file.name.lower(), int(obj.path_id)): target_ids[int(obj.path_id)]
+                  for obj in target_objects if int(obj.path_id) in target_ids}
+    objects = list(target_objects)
+    if Path(bundle).name == "herostatic_assets_all.bundle":
+        prefab = Path(bundle).with_name("herodynamic_assets_all.bundle")
+        if prefab.is_file():
+            objects.extend(UnityPy.load(str(prefab)).objects)
     for obj in objects:
-        if int(obj.path_id) in target_ids:
+        if (obj.assets_file.name.lower(), int(obj.path_id)) in identities:
             continue
         try:
             tree = obj.read_typetree()
@@ -116,10 +125,13 @@ def find_refs(bundle: str, targets: list[dict]) -> dict[str, dict]:
             continue
         object_name = str(tree.get("m_Name", tree.get("Name", "")))
         for ref_path, ref in walk_refs(tree):
-            if int(ref.get("m_FileID", ref.get("fileID", 0))) != 0:
-                continue
+            file_id = int(ref.get("m_FileID", ref.get("fileID", 0)))
+            target_file = obj.assets_file.name.lower()
+            if file_id:
+                external = str(obj.assets_file.externals[file_id - 1].path)
+                target_file = external.replace("\\", "/").rsplit("/", 1)[-1].lower()
             target_id = path_id(ref)
-            target = target_ids.get(target_id)
+            target = identities.get((target_file, target_id))
             if target is None:
                 continue
             name = str(target["name"])
@@ -128,6 +140,7 @@ def find_refs(bundle: str, targets: list[dict]) -> dict[str, dict]:
                 "pathId": int(obj.path_id),
                 "name": object_name,
                 "path": ref_path,
+                "serializedFile": obj.assets_file.name,
             }
             if obj.type.name == "Sprite":
                 rows[name]["spriteRefs"].append(item)
@@ -146,6 +159,34 @@ def main() -> int:
             records[str(row["name"])] = {"kind": kind, **row}
 
     targets = target_rows()
+    runtime_death = manifest.get("runtimeDeathAssetMapping", {})
+    atlas_root = ROOT / "romfs/Data/StreamingAssets/aa/Switch/atlases_assets_assets/sprites/_atlases"
+    map_mapping = runtime_death.get("map")
+    if isinstance(map_mapping, dict):
+        map_row = next((row for row in manifest.get("spriteTextures", [])
+                        if row.get("name") == map_mapping.get("targetTexture")), None)
+        if map_row is not None:
+            targets[str(map_row["name"]).lower()] = {
+                "name": map_row["name"],
+                "pathId": int(map_mapping["targetPathId"]),
+                "width": int(map_row["width"]),
+                "height": int(map_row["height"]),
+                "format": int(map_row["format"]),
+                "bundle": str(atlas_root / "hornet_map.spriteatlas.bundle"),
+                "sourceKind": "SkinLoader Map SpriteAtlas runtime PNG",
+            }
+    core_mapping = runtime_death.get("core")
+    if isinstance(core_mapping, dict):
+        for core_row in core_mapping.get("generated", []):
+            targets[str(core_row["name"]).lower()] = {
+                "name": core_row["name"],
+                "pathId": int(core_row["pathId"]),
+                "width": int(core_row["width"]),
+                "height": int(core_row["height"]),
+                "format": int(core_row["format"]),
+                "bundle": str(atlas_root / "core.spriteatlas.bundle"),
+                "sourceKind": "SkinLoader Core SpriteAtlas runtime PNG",
+            }
     by_bundle: defaultdict[str, list[dict]] = defaultdict(list)
     for name, record in records.items():
         target = targets.get(name.lower())
@@ -156,21 +197,53 @@ def main() -> int:
     for bundle, bundle_targets in by_bundle.items():
         refs_by_name.update(find_refs(bundle, bundle_targets))
 
+    # SpriteAtlas texture ownership lives in SpriteAtlas.m_RenderDataMap,
+    # rather than a direct Sprite.m_RD.texture pointer in these files.
+    def add_atlas_sprite_mapping(texture_name: str, sprite_name: str,
+                                 render_data_key: object, bundle: str) -> None:
+        refs = refs_by_name.setdefault(texture_name, {
+            "spriteRefs": [], "materialRefs": [], "otherRefs": [],
+        })
+        refs["spriteRefs"].append({
+            "type": "SpriteAtlas RenderDataMap",
+            "pathId": None,
+            "name": sprite_name,
+            "path": "m_RenderDataMap -> Texture2D",
+            "serializedFile": Path(bundle).name,
+            "renderDataKey": render_data_key,
+            "evidence": "构建时由 UnityPy 解析 SpriteAtlas.m_RenderDataMap 并匹配 PC/Switch RenderDataKey",
+        })
+
+    if isinstance(map_mapping, dict):
+        add_atlas_sprite_mapping(
+            str(map_mapping["targetTexture"]), str(map_mapping["spriteName"]),
+            map_mapping["renderDataKey"], str(atlas_root / "hornet_map.spriteatlas.bundle"),
+        )
+    if isinstance(core_mapping, dict):
+        for sprite_mapping in core_mapping.get("spriteMappings", []):
+            add_atlas_sprite_mapping(
+                str(sprite_mapping["targetTexture"]), str(sprite_mapping["name"]),
+                sprite_mapping["renderDataKey"], str(atlas_root / "core.spriteatlas.bundle"),
+            )
+
     rows = []
     for name, record in sorted(records.items(), key=lambda item: item[0].lower()):
         target = targets.get(name.lower())
         refs = refs_by_name.get(name, {"spriteRefs": [], "materialRefs": [], "otherRefs": []})
         if target is None:
             decision = "没有 Switch 目标证据"
+        elif record["kind"] == "spriteTextures" and refs["spriteRefs"] and refs["materialRefs"]:
+            decision = "Sprite Hook 直接匹配，Material Hook 回退到 sprite/；实际应用待运行日志确认"
+        elif record["kind"] == "spriteTextures" and refs["materialRefs"]:
+            decision = "Material Hook 回退到 sprite/；实际应用待运行日志确认"
         elif record["kind"] == "spriteTextures" and refs["spriteRefs"]:
-            decision = "可通过当前 SpriteRenderer/UI.Image Hook 应用"
+            decision = "Sprite/Atlas 纹理目标匹配；setter 是否触发及应用结果待运行日志确认"
         elif record["kind"] == "standaloneTextures" and refs["spriteRefs"]:
             decision = (
-                "无法通过当前 SpriteRenderer/UI.Image Hook 到达："
-                "Hook 查找 spriteTextures，但该记录属于 standaloneTextures"
+                "Sprite Hook 先查 sprite/，再回退 standalone/；应用结果待运行日志确认"
             )
         elif record["kind"] == "standaloneTextures" and refs["materialRefs"]:
-            decision = "可通过当前 Material.set_mainTexture Hook 应用"
+            decision = "Material 目录匹配；setter 是否触发及应用结果待运行日志确认"
         else:
             decision = "本地序列化引用尚未证明运行时路径"
 
@@ -189,8 +262,8 @@ def main() -> int:
         "package": str(CURRENT_PACKAGE),
         "manifest": str(MANIFEST),
         "runtimeRules": {
-            "standalone": "OnStandaloneTextureAssigned -> FindStandalone；由 Material.set_mainTexture 调用",
-            "sprite": "OnSpriteAssigned -> FindSpriteTexture；由 SpriteRenderer.set_sprite 和 UI.Image.set_sprite 调用",
+            "standalone": "OnStandaloneTextureAssigned -> FindStandalone，未命中时回退 FindSpriteTexture；由 Material.set_mainTexture 调用",
+            "sprite": "OnSpriteAssigned -> FindSpriteTexture，未命中时回退 FindStandalone；由 SpriteRenderer.set_sprite 和 UI.Image.set_sprite 调用",
         },
         "records": rows,
         "summary": {
@@ -205,7 +278,11 @@ def main() -> int:
                 row["manifestKind"] == "standaloneTextures" and bool(row["materialRefs"])
                 for row in rows
             ),
-            "notReachedByCurrentSpriteHook": sum(
+            "spriteMaterialBacked": sum(
+                row["manifestKind"] == "spriteTextures" and bool(row["materialRefs"])
+                for row in rows
+            ),
+            "standaloneSpriteFallback": sum(
                 row["manifestKind"] == "standaloneTextures" and bool(row["spriteRefs"])
                 for row in rows
             ),
@@ -217,8 +294,7 @@ def main() -> int:
     lines = [
         "# 运行时应用路径审计",
         "",
-        "这份报告检查的是部署包记录能否进入当前 Loader 的实际 Hook。",
-        "不是单纯检查 NS 是否存在同名 Texture2D。",
+        "这份报告检查运行时 Hook 的目录匹配与本地序列化引用。序列化引用不能证明 setter 被调用。",
         "",
         f"- 当前包：`{CURRENT_PACKAGE.name}`",
         f"- 清单记录：{len(rows)}（独立纹理={result['summary']['standaloneRecords']}，Sprite={result['summary']['spriteRecords']}）",
@@ -227,12 +303,13 @@ def main() -> int:
         "",
         "## 结论",
         "",
-        "当前 `OnSpriteAssigned` 只执行 `FindSpriteTexture`；因此被 NS `Sprite` 使用、",
-        "却放在 `standaloneTextures` 的记录，不会在 SpriteRenderer/UI.Image 路径中应用。",
+        "Sprite Hook 先查找 `sprite/`，未命中时回退到 `standalone/`；Material Hook",
+        "先查找 `standalone/`，未命中时回退到 `sprite/`。两条运行时入口都可以找到",
+        "按另一类引用归档的纹理；是否实际执行替换仍需 `operation=applied` 日志确认。",
         "",
         "## 记录",
         "",
-        "| 名称 | 清单类别 | NS 本地引用 | 当前运行时结论 |",
+        "| 名称 | 清单类别 | NS 已检查引用 | 当前应用入口结论 |",
         "| --- | --- | --- | --- |",
     ]
     for row in rows:
@@ -252,15 +329,23 @@ def main() -> int:
             f"| `{row['name']}` | `{row['manifestKind']}` | "
             f"{', '.join(refs) or '未发现本地引用'}（{target_text}） | {row['runtimeDecision']} |"
         )
+    rows_by_name = {row["name"]: row for row in rows}
+    lines += ["", "## 点名资源", ""]
+    for name in (
+        "Hornet_death_pieces_0000s_0001_6",
+        "Hornet_death_cocoon_particle_chunks",
+        "Hornet_death_spiders",
+    ):
+        row = rows_by_name.get(name)
+        if row is None:
+            lines.append(f"- `{name}`：当前包没有该纹理记录。")
+        else:
+            lines.append(
+                f"- `{name}`：`{row['manifestKind']}`；{row['runtimeDecision']}。"
+            )
     lines += [
         "",
-        "## 点名的三张",
-        "",
-        "- `Hornet_death_pieces_0000s_0001_6`：当前包有记录，但 NS 中是 Sprite→Texture2D；当前 Sprite Hook 不查 standalone。",
-        "- `Hornet_death_cocoon_particle_chunks`：同上。",
-        "- `Hornet_death_spiders`：当前包没有记录；它是 PC 37×148 到 NS 25×100 的缩放候选，只有历史 L8 清单包含。即使放入历史候选，仍需先修正 Sprite/standalone 分类。",
-        "",
-        "静态引用只证明资源类型和当前代码的可达性；最终的实际应用仍应以游戏日志中的 `operation=applied` 为准。",
+        "运行时资源需要 `operation=applied` 与游戏显示确认。",
         "",
     ]
     OUT_MD.write_text("\n".join(lines), encoding="utf-8")
