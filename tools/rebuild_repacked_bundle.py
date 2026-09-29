@@ -13,6 +13,7 @@ from pathlib import Path
 import UnityPy
 from PIL import Image
 from UnityPy.export.Texture2DConverter import image_to_texture2d
+from UnityPy.export import Texture2DConverter
 from UnityPy.streams import EndianBinaryReader
 
 
@@ -40,6 +41,8 @@ def _metadata(texture) -> dict[str, object]:
 
 def _encode(texture_object, png_path: str | Path, resize: bool) -> tuple[bytes, tuple[int, int]]:
     texture = texture_object.read()
+    if texture.m_MipCount != 1:
+        raise ValueError(f"{texture.m_Name}：当前编码仅支持单层 mip，实际 {texture.m_MipCount}")
     png = Path(png_path)
     with Image.open(png) as image:
         image = image.convert("RGBA")
@@ -67,6 +70,63 @@ def _encode(texture_object, png_path: str | Path, resize: bool) -> tuple[bytes, 
     return encoded, original_size
 
 
+def restrict_astc_regions(texture_object, encoded: bytes, regions: list) -> tuple[bytes, int]:
+    """Keep original ASTC blocks outside PIL-coordinate rectangles.
+
+    UnityPy supplies all Switch layout/padding operations. Each ASTC block is
+    16 bytes; coordinates are flipped just as image_to_texture2d does before
+    padding. A byte-exact swizzle round trip is required before merging.
+    """
+    texture = texture_object.read()
+    if int(texture.m_TextureFormat) not in (48, 50) or texture.m_MipCount != 1:
+        raise ValueError(f"{texture.m_Name}：区域替换仅支持单 mip ASTC 4×4/6×6")
+    swizzler = Texture2DConverter.TextureSwizzler
+    if not swizzler.is_switch_swizzled(texture_object.platform, texture.m_PlatformBlob):
+        raise ValueError(f"{texture.m_Name}：未识别为 Switch swizzled 纹理")
+    block_width, block_height = swizzler.TEXTURE_FORMAT_BLOCK_SIZE_MAP[texture.m_TextureFormat]
+    gobs = swizzler.get_switch_gobs_per_block(texture.m_PlatformBlob)
+    width, height = swizzler.get_padded_texture_size(
+        texture.m_Width, texture.m_Height, block_width, block_height, gobs)
+    original = bytes(texture.get_image_data())
+    if len(encoded) != len(original):
+        raise ValueError(f"{texture.m_Name}：区域编码字节数发生变化")
+    linear_original = bytes(swizzler.deswizzle(original, width, height, block_width, block_height, gobs))
+    if bytes(swizzler.swizzle(linear_original, width, height, block_width, block_height, gobs)) != original:
+        raise ValueError(f"{texture.m_Name}：原始布局 swizzle round-trip 不一致")
+    linear_new = bytes(swizzler.deswizzle(encoded, width, height, block_width, block_height, gobs))
+    blocks_x = width // block_width
+    if len(linear_original) != blocks_x * (height // block_height) * 16:
+        raise ValueError(f"{texture.m_Name}：ASTC padded block 数与资源长度不一致")
+    selected = set()
+    for region in regions:
+        if len(region) != 4 or any(int(value) != value for value in region):
+            raise ValueError(f"{texture.m_Name}：区域必须是四个整数")
+        x0, y0, x1, y1 = map(int, region)
+        if not (0 <= x0 < x1 <= texture.m_Width and 0 <= y0 < y1 <= texture.m_Height):
+            raise ValueError(f"{texture.m_Name}：区域越界 {region}")
+        raw_y0, raw_y1 = texture.m_Height - y1, texture.m_Height - y0
+        for by in range(raw_y0 // block_height, (raw_y1 + block_height - 1) // block_height):
+            for bx in range(x0 // block_width, (x1 + block_width - 1) // block_width):
+                selected.add(by * blocks_x + bx)
+    if not selected:
+        raise ValueError(f"{texture.m_Name}：目标区域为空")
+    merged = bytearray(linear_original)
+    for block in selected:
+        offset = block * 16
+        merged[offset:offset + 16] = linear_new[offset:offset + 16]
+    # Restore selected blocks and compare: no other texture blocks may change.
+    restored = bytearray(merged)
+    for block in selected:
+        offset = block * 16
+        restored[offset:offset + 16] = linear_original[offset:offset + 16]
+    if bytes(restored) != linear_original:
+        raise ValueError(f"{texture.m_Name}：非目标纹理块发生变化")
+    saved = bytes(swizzler.swizzle(merged, width, height, block_width, block_height, gobs))
+    if bytes(swizzler.deswizzle(saved, width, height, block_width, block_height, gobs)) != bytes(merged):
+        raise ValueError(f"{texture.m_Name}：合并后纹理布局不一致")
+    return saved, len(selected)
+
+
 def patch_bundle(
     bundle_path: str | Path,
     specs: list[dict[str, object]],
@@ -84,6 +144,8 @@ def patch_bundle(
     source_path = Path(bundle_path).resolve()
     switch_root_path = Path(switch_root).resolve()
     destination_root_path = Path(destination_root).resolve()
+    if destination_root_path.is_relative_to(switch_root_path):
+        raise ValueError("重建输出不能写入原始 Switch 资源目录")
     UnityPy.config.FALLBACK_UNITY_VERSION = "6000.0.50f1"
     source_bytes = source_path.read_bytes()
     environment = UnityPy.load(str(source_path))
@@ -102,6 +164,9 @@ def patch_bundle(
         texture = obj.read()
         before = _metadata(texture)
         encoded, input_size = _encode(obj, str(spec["png"]), bool(spec.get("resize", False)))
+        block_count = None
+        if spec.get("regions"):
+            encoded, block_count = restrict_astc_regions(obj, encoded, spec["regions"])
         stream = texture.m_StreamData
         if stream.size:
             resource_name = stream.path.replace("\\", "/").rsplit("/", 1)[-1]
@@ -132,6 +197,9 @@ def patch_bundle(
                 "format": int(texture.m_TextureFormat),
                 "encodedSize": len(encoded),
                 "encodedSha256": _digest(encoded),
+                "regions": spec.get("regions"),
+                "selectedAstcBlockCount": block_count,
+                "nonTargetTextureBlocksUnchanged": block_count is not None,
             }
         )
         print(
